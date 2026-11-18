@@ -65,5 +65,50 @@ async def create_issue(owner: str, repo: str, title: str, body: str) -> dict:
         body=body
     )
 
+@mcp.resource("assistant://guidelines")
+def get_assistant_guidelines() -> str:
+    """
+    Provide development guidelines for the GitHub assistant.
+    """
+
+    return """
+    GitHub Developer Assistant Guidelines
+
+    1. Never invent GitHub repository information.
+    2. Verify repository owner and name before write operations.
+    3. Explain proposed changes clearly.
+    4. Never create an issue without human approval.
+    5. Use clear, descriptive issue titles.
+    6. Include reproduction steps when reporting bugs.
+    7. Prefer factual information from GitHub API responses.
+    """
+
+@mcp.resource("github://repos/{owner}/{repo}/readme")
+async def get_repository_readme(owner: str, repo: str) -> str:
+    return await github.get_repository_readme(
+        owner,
+        repo
+    )
+
+@mcp.prompt()
+def review_pull_request(owner: str, repo: str, pull_number: int) -> str:
+    return f"""
+    Review pull request #{pull_number}
+    in repository {owner}/{repo}.
+
+    Analyze:
+    1. Code quality
+    2. Potential bugs
+    3. Security vulnerabilities
+    4. Performance issues
+    5. Suggested improvements
+
+    Provide actionable feedback with explanations.
+    """
+
 if __name__ == "__main__":
-    mcp.run()
+     mcp.run(
+        transport="streamable-http",
+        host="127.0.0.1",
+        port=8000
+    )

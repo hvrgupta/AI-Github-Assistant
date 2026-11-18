@@ -14,7 +14,7 @@ import uuid
 
 load_dotenv()
 
-github_token = os.getenv("GITHUB_TOKEN")
+# github_token = os.getenv("GITHUB_TOKEN")
 
 def format_result(result) -> str:
 
@@ -38,20 +38,20 @@ def format_result(result) -> str:
 
 async def main():
 
-    github_token = os.getenv("GITHUB_TOKEN")
+    # github_token = os.getenv("GITHUB_TOKEN")
 
-    if not github_token:
-        raise RuntimeError("GITHUB_TOKEN is missing from .env")
+    # if not github_token:
+    #     raise RuntimeError("GITHUB_TOKEN is missing from .env")
 
     # Configure the MCP server subprocess.
-    server_params = StdioServerParameters(
-        command=sys.executable,
-        args=[str(Path(__file__).with_name("server.py"))],
-        env={"GITHUB_TOKEN": github_token}
-    )
+    # server_params = StdioServerParameters(
+    #     command=sys.executable,
+    #     args=[str(Path(__file__).with_name("server.py"))],
+    #     env={"GITHUB_TOKEN": github_token}
+    # )
 
     # Connect to the MCP server.
-    async with Client(server_params) as mcp_client:
+    async with Client("http://127.0.0.1:8000/mcp") as mcp_client:
 
         # Discover available MCP tools.
         available_tools = await mcp_client.list_tools()

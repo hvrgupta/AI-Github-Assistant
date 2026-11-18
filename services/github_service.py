@@ -1,5 +1,6 @@
 import os
 import httpx
+import base64
 
 from dotenv import load_dotenv
 
@@ -97,3 +98,24 @@ class GithubService:
                 "state": issue["state"],
                 "created_at": issue["created_at"]
             }
+
+    async def get_repository_readme(self, owner: str, repo: str) -> str:
+        url = f"{BASE_URL}/repos/{owner}/{repo}/readme"
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(
+                url,
+                headers=self.headers
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            encoded_content = data["content"]
+
+            decoded_content = base64.b64decode(
+                encoded_content
+            ).decode("utf-8")
+
+            return decoded_content
