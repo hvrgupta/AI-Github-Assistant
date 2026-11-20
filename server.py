@@ -1,18 +1,134 @@
+from typing import Annotated
 from mcp.server import MCPServer
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.mcpserver import Elicit, Resolve
+from mcp.types import ToolAnnotations
+from pydantic import AnyHttpUrl, BaseModel, Field
 
 from services.github_service import GithubService
 
-mcp = MCPServer("Github Developer Assistant")
-github = GithubService()
 
-@mcp.tool()
-async def search_repo(query: str, limit: int = 5) -> dict:
-    """ 
+SERVER_NAME = "GitHub Developer Assistant"
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 8000
+RESOURCE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}/mcp"
+AUTH_ISSUER_URL = "https://auth.example.com"
+
+
+# Tool input/output schemas
+class PullRequestOutput(BaseModel):
+    number: int
+    title: str
+    state: str
+    author: str
+    description: str | None = None
+    url: str
+    created_at: str
+    updated_at: str
+    merged: bool
+    base_branch: str
+    head_branch: str
+
+
+class RepositoryOutput(BaseModel):
+    name: str
+    description: str | None = None
+    url: str
+    stars: int
+    language: str | None = None
+
+
+class RepositorySearchOutput(BaseModel):
+    total_count: int
+    repositories: list[RepositoryOutput]
+
+
+class IssueOutput(BaseModel):
+    number: int
+    title: str
+    url: str
+    state: str
+    created_at: str
+
+
+class CreateIssueOutput(BaseModel):
+    created: bool
+    message: str
+    issue: IssueOutput | None = None
+
+
+class IssueConfirmation(BaseModel):
+    confirm: bool = Field(
+        description="Do you want to create this GitHub issue?"
+    )
+
+
+# Authentication
+KNOWN_TOKENS: dict[str, AccessToken] = {
+    "dev-read-token": AccessToken(
+        token="dev-read-token",
+        client_id="read-client",
+        scopes=["github:read"],
+        resource=RESOURCE_URL
+    ),
+    "dev-write-token": AccessToken(
+        token="dev-write-token",
+        client_id="write-client",
+        scopes=["github:read", "github:write"],
+        resource=RESOURCE_URL
+    )
+}
+
+
+class StaticTokenVerifier(TokenVerifier):
+    async def verify_token(self, token: str) -> AccessToken | None:
+        return KNOWN_TOKENS.get(token)
+
+
+def require_scope(required_scope: str) -> None:
+    access_token = get_access_token()
+    if access_token is None:
+        raise PermissionError("Authentication required")
+    if required_scope not in access_token.scopes:
+        raise PermissionError(f"Missing required permission: {required_scope}")
+
+
+# MCP server and service dependencies
+mcp = MCPServer(
+    SERVER_NAME,
+    token_verifier=StaticTokenVerifier(),
+    auth=AuthSettings(
+        issuer_url=AnyHttpUrl(AUTH_ISSUER_URL),
+        resource_server_url=AnyHttpUrl(RESOURCE_URL),
+        required_scopes=["github:read"],
+        validate_token_resource=True
+    )
+)
+
+github: GithubService = GithubService()
+
+
+# MCP tools
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Search GitHub repositories",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True
+    )
+)
+async def search_repo(query: str, limit: int = 5) -> RepositorySearchOutput:
+    """
     Search GitHub repositories using a search query.
+
     Args:
         query: GitHub repository search query.
         limit: Maximum number of repositories to return.
     """
+    require_scope("github:read")
     if not query.strip():
         raise ValueError("Search query cannot be empty")
 
@@ -24,17 +140,31 @@ async def search_repo(query: str, limit: int = 5) -> dict:
             query=query,
             limit=limit
         )
-
-        return result
-
     except Exception as e:
         raise RuntimeError(
             f"GitHub repository search failed: {e}"
         ) from e
 
-@mcp.tool()
-async def get_pull_request(owner: str, repo: str, pull_number: int) -> dict:
+    return RepositorySearchOutput(**result)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Get pull request details",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True
+    )
+)
+async def get_pull_request(
+    owner: str,
+    repo: str,
+    pull_number: int
+) -> PullRequestOutput:
     """Get details of a GitHub pull request."""
+
+    require_scope("github:read")
 
     if not owner.strip() or not repo.strip():
         raise ValueError("Owner and repository are required")
@@ -42,15 +172,55 @@ async def get_pull_request(owner: str, repo: str, pull_number: int) -> dict:
     if pull_number < 1:
         raise ValueError("Pull request number must be positive")
 
-    return await github.get_pull_request(
+    result = await github.get_pull_request(
         owner=owner,
         repo=repo,
         pull_number=pull_number
     )
 
-@mcp.tool()
-async def create_issue(owner: str, repo: str, title: str, body: str) -> dict:
+    return PullRequestOutput(**result)
+
+
+async def confirm_issue(
+    owner: str,
+    repo: str,
+    title: str
+) -> IssueConfirmation | Elicit[IssueConfirmation]:
+    require_scope("github:write")
+
+    return Elicit(
+        f"Do you want to create the issue '{title}' in {owner}/{repo}?",
+        IssueConfirmation
+    )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Create a GitHub issue",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True
+    )
+)
+async def create_issue(
+    owner: str,
+    repo: str,
+    title: str,
+    body: str,
+    confirmation: Annotated[
+        IssueConfirmation,
+        Resolve(confirm_issue)
+    ]
+) -> CreateIssueOutput:
     """Create a new issue in a GitHub repository."""
+    require_scope("github:write")
+
+    if not confirmation.confirm:
+        return CreateIssueOutput(
+            created=False,
+            message="Issue creation cancelled by user."
+        )
 
     if not owner.strip() or not repo.strip():
         raise ValueError("Owner and repository are required")
@@ -58,13 +228,20 @@ async def create_issue(owner: str, repo: str, title: str, body: str) -> dict:
     if not title.strip():
         raise ValueError("Issue title cannot be empty")
 
-    return await github.create_issue(
+    result = await github.create_issue(
         owner=owner,
         repo=repo,
         title=title,
         body=body
     )
+    return CreateIssueOutput(
+        created=True,
+        message="Issue created successfully.",
+        issue=IssueOutput(**result)
+    )
 
+
+# MCP resources and prompts
 @mcp.resource("assistant://guidelines")
 def get_assistant_guidelines() -> str:
     """
@@ -83,12 +260,11 @@ def get_assistant_guidelines() -> str:
     7. Prefer factual information from GitHub API responses.
     """
 
+
 @mcp.resource("github://repos/{owner}/{repo}/readme")
 async def get_repository_readme(owner: str, repo: str) -> str:
-    return await github.get_repository_readme(
-        owner,
-        repo
-    )
+    return await github.get_repository_readme(owner, repo)
+
 
 @mcp.prompt()
 def review_pull_request(owner: str, repo: str, pull_number: int) -> str:
@@ -106,9 +282,14 @@ def review_pull_request(owner: str, repo: str, pull_number: int) -> str:
     Provide actionable feedback with explanations.
     """
 
-if __name__ == "__main__":
-     mcp.run(
+
+def run_server() -> None:
+    mcp.run(
         transport="streamable-http",
-        host="127.0.0.1",
-        port=8000
+        host=SERVER_HOST,
+        port=SERVER_PORT
     )
+
+
+if __name__ == "__main__":
+    run_server()

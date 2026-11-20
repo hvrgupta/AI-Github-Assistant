@@ -1,108 +1,92 @@
 # AI GitHub Developer Assistant
 
-An AI-powered GitHub developer assistant built with the **Model Context Protocol (MCP)**, **LangChain**, and **LangGraph**. The project exposes GitHub operations through an MCP server and connects those tools to an LLM-powered agent.
+An AI-powered GitHub developer assistant built with the **Model Context Protocol (MCP)**, **LangChain**, and **LangGraph**. The project includes an authenticated GitHub MCP server, LangChain agents that consume MCP tools, and an example that connects to multiple MCP servers.
 
-> **Project status:** The current implementation covers GitHub MCP tools, an MCP client, LangChain integration, and human-in-the-loop approval for issue creation. MCP Resources and Prompts are planned next; they are not described as implemented here.
+## Features
 
-## Current features
+### GitHub integration
 
-### GitHub service layer
+The GitHub service layer communicates with the GitHub REST API and supports:
 
-The GitHub service layer communicates with the GitHub REST API and currently supports:
-
-- Searching GitHub repositories.
+- Searching repositories.
 - Retrieving pull request details.
-- Creating GitHub issues.
+- Creating issues.
+- Reading repository README files.
 
-### MCP server
+The MCP server exposes the GitHub operations as tools, and also provides an assistant-guidelines resource, a repository README resource template, and a pull-request review prompt. Tool responses use typed Pydantic output models.
 
-The MCP server exposes the GitHub operations as tools that MCP-compatible clients can discover and invoke.
+### Authentication and permissions
 
-### LangChain agent integration
+The GitHub MCP server uses Streamable HTTP at `http://127.0.0.1:8000/mcp`. Its example token verifier recognizes two development tokens:
 
-The agent:
+- `dev-read-token`: `github:read`
+- `dev-write-token`: `github:read` and `github:write`
 
-- Starts the MCP server as a subprocess using the STDIO transport.
-- Connects to it through the MCP Python client.
-- Discovers available MCP tools.
-- Makes those tools available to a LangChain agent.
-- Uses an adapter to bridge MCP tool calls to LangChain-compatible tools.
+The MCP access token authorizes calls to the MCP server. Separately, `GITHUB_TOKEN` authorizes the server's requests to the GitHub API. For issue creation, both the MCP token and GitHub token must permit writes to the target repository.
 
-### Human-in-the-loop approval
+These static tokens and the example issuer configuration are for local learning only. Replace them with a proper identity provider and secure token storage before deploying the server.
 
-Issue creation is treated as a side-effecting action. The LangChain agent uses `HumanInTheLoopMiddleware` to pause before executing `create_issue`, allowing a human to approve, edit, or reject the proposed action.
+### Human confirmation for issue creation
 
-The current approval workflow uses an in-memory LangGraph checkpointer. Checkpoints are not durable across process restarts.
+The LangChain agent uses human-in-the-loop middleware to pause before invoking `create_issue`, so a person can approve, edit, or reject the proposed tool call. The MCP server also uses form elicitation to ask for confirmation before it sends the write request to GitHub. These are separate confirmation steps at the agent and server boundaries.
+
+### Multiple MCP servers with LangChain
+
+[`multi_server_agent.py`](./multi_server_agent.py) demonstrates dynamic tool discovery from both:
+
+- The GitHub MCP server over Streamable HTTP.
+- The MCP filesystem server over STDIO, launched with `npx`.
+
+The script converts each discovered MCP tool's JSON Schema input into a Pydantic model and wraps it as a LangChain `StructuredTool`. This supports the common primitive, array, object, required, optional, default, and description fields used by these tools. JSON Schema is extensive; this example is not intended as a complete implementation of every JSON Schema keyword.
+
+The example asks the agent to list the files in:
+
+`D:\Dev\learn-agentic-ai\ai-github-assistant`
+
+The filesystem server is configured with `D:\Dev\learn-agentic-ai` as its allowed root.
 
 ## Architecture
 
+The GitHub MCP server and the filesystem MCP server use different transports:
+
 ```text
-User
-  |
-  v
-LangChain Agent (LLM)
-  |
-  v
-LangChain tool adapter
-  |
-  v
-MCP Client
-  |
-  | STDIO
-  v
-MCP Server
-  |
-  v
-GitHub Service
-  |
-  v
-GitHub REST API
+LangChain agent
+  ├── LangChain adapters ── MCP client ── Streamable HTTP ── GitHub MCP server ── GitHub REST API
+  └── LangChain adapters ── MCP client ── STDIO ──────────── Filesystem MCP server
 ```
 
-For issue creation, the human-in-the-loop middleware pauses the agent before the MCP tool is executed.
+The issue-creation flow has both agent-level approval and server-side elicitation before the GitHub API call.
 
 ## Project structure
-
-The core project is organized approximately as follows:
 
 ```text
 ai-github-assistant/
 ├── agent.py
+├── multi_server_agent.py
 ├── server.py
+├── test_resources.py
 ├── .env
-├── .gitignore
 ├── requirements.txt
-├── services/
-│   ├── __init__.py
-│   └── github_service.py
-└── tests/
+└── services/
+    └── github_service.py
 ```
-
-Your local repository may contain additional files as development progresses.
 
 ## Prerequisites
 
 - Python 3.10 or newer.
-- A GitHub account.
-- A GitHub personal access token with access to the repository you want to use.
-- An OpenAI API key for the LangChain agent.
+- Node.js and `npx` for the MCP filesystem server.
+- A GitHub personal access token with access to the repositories you use. Issue creation requires write access to issues in the target repository.
+- An OpenAI API key for the LangChain agents.
 
 ## Setup
 
-### 1. Clone the repository
-
-```bash
-git clone <your-repository-url>
-cd ai-github-assistant
-```
-
-### 2. Create and activate a virtual environment
+### 1. Create and activate a virtual environment
 
 Windows PowerShell:
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 ```
 
 macOS/Linux:
@@ -112,80 +96,78 @@ python -m venv .venv
 source .venv/bin/activate
 ```
 
-### 3. Install dependencies
+### 2. Install Python dependencies
 
-```bash
+```powershell
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-### 4. Configure environment variables
+### 3. Configure environment variables
 
 Create a `.env` file in the project root:
 
 ```env
 GITHUB_TOKEN=your_github_token
 OPENAI_API_KEY=your_openai_api_key
+MCP_ACCESS_TOKEN=dev-read-token
 ```
 
-Do not commit `.env` or expose either secret in logs, screenshots, or source control.
+Use `MCP_ACCESS_TOKEN=dev-write-token` when testing issue creation. The server currently recognizes only its two configured development token strings. Do not commit `.env` or print token values in logs.
 
-For the GitHub token, grant access only to the repositories needed for testing. The current issue-creation workflow requires **Issues: Read and write** permission for the target repository. Repository search and pull request access may require additional read permissions depending on the operation and repository visibility.
+## Run
 
-## Run the project
+### Start the GitHub MCP server
 
-### Start the MCP server with MCP Inspector
+In one terminal, activate the environment and run:
 
-From the project root, with the virtual environment activated:
-
-```bash
-mcp dev server.py
+```powershell
+python .\server.py
 ```
 
-Use the Inspector to discover and test the available GitHub tools.
+The server listens at `http://127.0.0.1:8000/mcp`.
 
-### Run the LangChain agent
+### Run the GitHub agent
 
-```bash
-python agent.py
+In another terminal:
+
+```powershell
+python .\agent.py
 ```
 
-The agent starts the MCP server as a subprocess, discovers its tools, and makes them available to the LangChain agent. When the agent proposes creating an issue, the human-in-the-loop middleware pauses for a decision.
+This agent connects to the already-running GitHub MCP server over Streamable HTTP, discovers its tools, and runs its repository-search and issue-creation examples. Creating an issue requires the `dev-write-token`, a GitHub token with repository write access, and confirmation at both approval prompts.
 
-## Human-in-the-loop behavior
+### Run the multi-server example
 
-The current policy allows read-only tools to execute without approval and requires human review for issue creation:
+With the GitHub MCP server running and Node.js/`npx` available:
 
-- `search_repositories`: no approval required.
-- `get_pull_request`: no approval required.
-- `create_issue`: human approval required.
+```powershell
+python .\multi_server_agent.py
+```
 
-The human can approve, edit, or reject the proposed action. Always inspect the owner, repository, title, and body before approving a write operation.
+The script connects to the GitHub server and launches the filesystem MCP server as an STDIO subprocess. It keeps both MCP client sessions open during agent execution, discovers tools from each server, adapts their input schemas, and prints the agent's response.
 
-**Security note:** Middleware approval protects calls made through this LangChain agent. It does not automatically protect the MCP server from other clients that can connect to it. Enforce authorization at the server/service boundary as well when hardening the project.
+### Test MCP resources and prompts
+
+With the GitHub MCP server running:
+
+```powershell
+python .\test_resources.py
+```
 
 ## Development notes
 
-- The MCP server and GitHub service layer are separate so API logic is not coupled to the agent.
-- The MCP client communicates with the local server over STDIO.
-- The LangChain adapter converts discovered MCP tool schemas into LangChain-compatible tools.
-- The current in-memory checkpointer is suitable for learning and local experiments, not durable production workflows.
-- Dependency versions are intentionally not pinned in this initial requirements file. For reproducible deployments, add tested version pins or a lock file.
-
-## Planned improvements
-
-- MCP Resources and Resource Templates.
-- MCP Prompts.
-- Streamable HTTP transport and remote MCP connectivity.
-- Stronger authentication and authorization boundaries.
-- More robust validation, error handling, retries, and logging.
-- Persistent checkpoint storage.
-- Automated tests and deployment.
+- `services/github_service.py` contains GitHub REST API operations; `server.py` exposes them through MCP.
+- `agent.py` demonstrates a GitHub-only LangChain agent and MCP elicitation.
+- `multi_server_agent.py` demonstrates dynamic tool integration across Streamable HTTP and STDIO MCP servers.
+- The agent examples use in-memory state where configured; this is suitable for local learning, not durable production workflows.
+- The filesystem server is limited to its configured root, but filesystem write-capable tools are still available to the agent. Review the request and tool actions carefully.
 
 ## Security
 
 - Keep `.env` out of version control.
-- Never hard-code API tokens.
+- Never hard-code real API credentials or expose tokens in logs.
 - Use least-privilege GitHub token permissions.
-- Review all proposed write actions before approval.
-- Do not assume agent-level HITL is a substitute for server-side authorization.
+- Review issue details before approving write operations.
+- Enforce authorization at the MCP server/service boundary; agent middleware is not a substitute for server-side checks.
+- Replace the example static token verifier before exposing the server beyond a trusted local environment.
