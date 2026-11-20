@@ -1,3 +1,8 @@
+import asyncio
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
+
+import httpx
 from typing import Annotated
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -15,6 +20,11 @@ SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8000
 RESOURCE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}/mcp"
 AUTH_ISSUER_URL = "https://auth.example.com"
+GITHUB_REQUEST_TIMEOUT_SECONDS = 20
+GITHUB_MAX_ATTEMPTS = 3
+GITHUB_RETRY_BASE_DELAY_SECONDS = 0.5
+
+T = TypeVar("T")
 
 
 # Tool input/output schemas
@@ -110,6 +120,71 @@ mcp = MCPServer(
 github: GithubService = GithubService()
 
 
+def _github_http_error_message(error: httpx.HTTPStatusError) -> str:
+    status_code = error.response.status_code
+    try:
+        response_body = error.response.json()
+    except ValueError:
+        response_body = None
+
+    detail = (
+        response_body.get("message")
+        if isinstance(response_body, dict)
+        else None
+    )
+    if detail:
+        return f"GitHub returned HTTP {status_code}: {detail}"
+    return f"GitHub returned HTTP {status_code}"
+
+
+async def call_github(
+    operation: str,
+    request: Callable[[], Awaitable[T]],
+    *,
+    retry_safe: bool
+) -> T:
+    """Bound GitHub API calls and retry only safe, transient failures."""
+    attempts = GITHUB_MAX_ATTEMPTS if retry_safe else 1
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return await asyncio.wait_for(
+                request(),
+                timeout=GITHUB_REQUEST_TIMEOUT_SECONDS
+            )
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            message = _github_http_error_message(exc)
+
+            if not retry_safe or status_code < 500 or attempt == attempts:
+                raise RuntimeError(
+                    f"GitHub {operation} failed: {message}"
+                ) from exc
+
+            await asyncio.sleep(
+                GITHUB_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+            )
+        except (httpx.TimeoutException, httpx.TransportError, TimeoutError) as exc:
+            if not retry_safe:
+                raise RuntimeError(
+                    f"GitHub {operation} timed out or lost its connection. "
+                    "It was not retried because it may have changed GitHub "
+                    f"state; its outcome may be unknown. Details: {exc}"
+                ) from exc
+
+            if attempt == attempts:
+                raise RuntimeError(
+                    f"GitHub {operation} failed after {attempts} attempts. "
+                    f"Check the GitHub API connection. Details: {exc}"
+                ) from exc
+
+            await asyncio.sleep(
+                GITHUB_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+            )
+
+    raise RuntimeError(f"GitHub {operation} failed without a result")
+
+
 # MCP tools
 @mcp.tool(
     annotations=ToolAnnotations(
@@ -135,15 +210,14 @@ async def search_repo(query: str, limit: int = 5) -> RepositorySearchOutput:
     if not 1 <= limit <= 10:
         raise ValueError("Limit must be between 1 and 10")
 
-    try:
-        result = await github.search_repo(
+    result = await call_github(
+        "repository search",
+        lambda: github.search_repo(
             query=query,
             limit=limit
-        )
-    except Exception as e:
-        raise RuntimeError(
-            f"GitHub repository search failed: {e}"
-        ) from e
+        ),
+        retry_safe=True
+    )
 
     return RepositorySearchOutput(**result)
 
@@ -172,10 +246,14 @@ async def get_pull_request(
     if pull_number < 1:
         raise ValueError("Pull request number must be positive")
 
-    result = await github.get_pull_request(
-        owner=owner,
-        repo=repo,
-        pull_number=pull_number
+    result = await call_github(
+        "pull request lookup",
+        lambda: github.get_pull_request(
+            owner=owner,
+            repo=repo,
+            pull_number=pull_number
+        ),
+        retry_safe=True
     )
 
     return PullRequestOutput(**result)
@@ -228,11 +306,15 @@ async def create_issue(
     if not title.strip():
         raise ValueError("Issue title cannot be empty")
 
-    result = await github.create_issue(
-        owner=owner,
-        repo=repo,
-        title=title,
-        body=body
+    result = await call_github(
+        "issue creation",
+        lambda: github.create_issue(
+            owner=owner,
+            repo=repo,
+            title=title,
+            body=body
+        ),
+        retry_safe=False
     )
     return CreateIssueOutput(
         created=True,
@@ -263,7 +345,11 @@ def get_assistant_guidelines() -> str:
 
 @mcp.resource("github://repos/{owner}/{repo}/readme")
 async def get_repository_readme(owner: str, repo: str) -> str:
-    return await github.get_repository_readme(owner, repo)
+    return await call_github(
+        "repository README lookup",
+        lambda: github.get_repository_readme(owner, repo),
+        retry_safe=True
+    )
 
 
 @mcp.prompt()

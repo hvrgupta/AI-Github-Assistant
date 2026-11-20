@@ -145,7 +145,15 @@ With the GitHub MCP server running and Node.js/`npx` available:
 python .\multi_server_agent.py
 ```
 
-The script connects to the GitHub server and launches the filesystem MCP server as an STDIO subprocess. It keeps both MCP client sessions open during agent execution, discovers tools from each server, adapts their input schemas, and prints the agent's response.
+The script connects to the GitHub server and launches the filesystem MCP server as an STDIO subprocess. A dedicated worker task owns each MCP transport context from connect through reconnect and shutdown; tool calls are queued through that owner so AnyIO cancellation scopes are entered and exited in the same task. The script discovers tools from each server, adapts their input schemas, and prints the agent's response.
+
+#### MCP error handling
+
+The multi-server example gives each MCP request a 45-second timeout. If a transport failure or timeout makes a session unusable, its connection manager closes the old session and attempts to establish a new one. Only tools explicitly annotated as read-only are replayed after reconnection, and the reconnect/replay is attempted once. Other retry-safe request failures use bounded retries with exponential backoff.
+
+An MCP tool result marked as an error is different from a transport failure: its returned error text is surfaced immediately and is not retried. Tools without an explicit read-only annotation—including write operations—are never replayed after a timeout or connection loss, because the server may have completed the action before the response was lost. The connection is re-established for later work, and the error says the write outcome may be unknown. If reconnection itself fails, the error identifies the server and recommends checking that it is running.
+
+On the GitHub MCP server, GitHub API calls have a 20-second overall deadline. Read-only API calls retry transient connection/timeouts and HTTP 5xx failures up to two times. Issue creation is never retried automatically: if its request times out or loses its connection, the issue may already have been created, so check GitHub before trying again. Other GitHub HTTP errors include the returned status and message in the MCP tool error.
 
 ### Test MCP resources and prompts
 
