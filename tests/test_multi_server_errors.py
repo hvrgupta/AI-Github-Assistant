@@ -6,9 +6,11 @@ import anyio
 import httpx2
 
 from assistant.mcp.mcp_client_runtime import (
-    MCPRequestError,
     MCPConnectionManager,
-    call_mcp_tool
+    MCPRequestError,
+    call_mcp_tool,
+    create_args_schema,
+    create_langchain_tool,
 )
 
 
@@ -167,6 +169,91 @@ class MCPReconnectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.calls, 1)
         self.assertEqual(connection.reconnect_calls, 0)
+
+    async def test_mcp_tool_errors_are_returned_to_the_agent(self):
+        class ErrorConnection:
+            server_name = "GitHub"
+
+            async def call_tool(self, *_args, **_kwargs):
+                return tool_result(
+                    is_error=True,
+                    text="Limit must be between 1 and 10"
+                )
+
+        mcp_tool = SimpleNamespace(
+            name="search_repo",
+            description="Search repositories",
+            annotations=SimpleNamespace(read_only_hint=True),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                },
+                "required": ["query"]
+            }
+        )
+        langchain_tool = create_langchain_tool(
+            ErrorConnection(),
+            mcp_tool
+        )
+
+        result = await langchain_tool.ainvoke(
+            {"query": "example"}
+        )
+
+        self.assertIn("Tool error:", result)
+        self.assertIn("Limit must be between 1 and 10", result)
+
+    async def test_argument_validation_errors_are_returned_to_the_agent(self):
+        class UnusedConnection:
+            async def call_tool(self, *_args, **_kwargs):
+                self.fail("Invalid arguments must not reach the MCP server")
+
+        def reject_empty_path(_tool_name, _arguments):
+            raise ValueError("path: Filesystem paths must be non-empty strings.")
+
+        mcp_tool = SimpleNamespace(
+            name="read_file",
+            description="Read a file",
+            annotations=SimpleNamespace(read_only_hint=True),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                },
+                "required": ["path"]
+            }
+        )
+        langchain_tool = create_langchain_tool(
+            UnusedConnection(),
+            mcp_tool,
+            argument_validator=reject_empty_path
+        )
+
+        result = await langchain_tool.ainvoke({"path": ""})
+
+        self.assertIn("Tool error:", result)
+        self.assertIn("non-empty strings", result)
+
+    async def test_numeric_tool_limits_are_preserved_from_json_schema(self):
+        mcp_tool = SimpleNamespace(
+            name="search_repo",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "default": 5
+                    }
+                }
+            }
+        )
+        args_schema = create_args_schema(mcp_tool)
+
+        with self.assertRaises(ValueError):
+            args_schema(limit=11)
 
     async def test_read_only_transport_failure_reconnects_and_retries(self):
         original = FakeMCPClient(error=httpx2.ReadTimeout("temporary timeout"))

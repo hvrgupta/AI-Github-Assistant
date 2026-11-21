@@ -167,18 +167,30 @@ def create_pydantic_model(
         )
 
         description = field_schema.get("description", "")
+        constraints = {}
+        if field_schema.get("type") in {"integer", "number"}:
+            for schema_key, field_key in (
+                ("minimum", "ge"),
+                ("maximum", "le"),
+                ("exclusiveMinimum", "gt"),
+                ("exclusiveMaximum", "lt"),
+            ):
+                if schema_key in field_schema:
+                    constraints[field_key] = field_schema[schema_key]
 
         if field_name in required_fields:
             field_definition = Field(
                 ...,
-                description=description
+                description=description,
+                **constraints
             )
         else:
             default_value = field_schema.get("default", None)
 
             field_definition = Field(
                 default=default_value,
-                description=description
+                description=description,
+                **constraints
             )
 
         fields[field_name] = (
@@ -814,23 +826,26 @@ def create_langchain_tool(
 
     async def dynamic_tool(**kwargs):
 
-        clean_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if value is not None
-        }
-        if argument_validator is not None:
-            clean_kwargs = argument_validator(
-                mcp_tool.name,
-                clean_kwargs
-            )
+        try:
+            clean_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if value is not None
+            }
+            if argument_validator is not None:
+                clean_kwargs = argument_validator(
+                    mcp_tool.name,
+                    clean_kwargs
+                )
 
-        result = await call_mcp_tool(
-            connection,
-            mcp_tool.name,
-            clean_kwargs,
-            retry_safe=_tool_is_read_only(mcp_tool)
-        )
+            result = await call_mcp_tool(
+                connection,
+                mcp_tool.name,
+                clean_kwargs,
+                retry_safe=_tool_is_read_only(mcp_tool)
+            )
+        except (MCPRequestError, ValueError) as exc:
+            return f"Tool error: {exc}"
 
         structured_content = getattr(
             result,

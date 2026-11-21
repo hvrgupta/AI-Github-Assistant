@@ -2,7 +2,7 @@ import asyncio
 import hmac
 import os
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
+from typing import Annotated, TypeVar
 
 import httpx
 from dotenv import load_dotenv
@@ -11,7 +11,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.types import ToolAnnotations
-from pydantic import AnyHttpUrl, BaseModel
+from pydantic import AnyHttpUrl, BaseModel, Field
 
 from assistant.services.github_service import GithubService
 
@@ -232,7 +232,10 @@ async def call_github(
         openWorldHint=True
     )
 )
-async def search_repo(query: str, limit: int = 5) -> RepositorySearchOutput:
+async def search_repo(
+    query: str,
+    limit: Annotated[int, Field(ge=1, le=10)] = 5
+) -> RepositorySearchOutput:
     """
     Search GitHub repositories using a search query.
 
