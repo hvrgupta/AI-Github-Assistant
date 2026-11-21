@@ -1,0 +1,8 @@
+services:
+  caddy:
+    environment:
+      CADDY_DOMAIN: localhost
+    ports: !override
+      - "8088:80"
+    volumes:
+      - ./Caddyfile.local:/etc/caddy/Caddyfile:ro

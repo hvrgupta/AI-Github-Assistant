@@ -1,6 +1,6 @@
 
 import asyncio
-from services.github_service import GithubService
+from assistant.services.github_service import GithubService
 
 
 async def main():
@@ -20,4 +20,5 @@ async def main():
         print("URL:", repo["url"])
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

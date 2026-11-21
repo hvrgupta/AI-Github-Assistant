@@ -1,0 +1,150 @@
+services:
+  github-mcp:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.mcp
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN:?Set GITHUB_TOKEN in .env}
+      MCP_ACCESS_TOKEN: ${MCP_ACCESS_TOKEN:?Set MCP_ACCESS_TOKEN in .env}
+      MCP_ACCESS_SCOPES: ${MCP_ACCESS_SCOPES:-github:read}
+      MCP_SERVER_HOST: 0.0.0.0
+      MCP_SERVER_PORT: "8000"
+      MCP_RESOURCE_URL: http://github-mcp:8000/mcp
+      MCP_AUTH_ISSUER_URL: http://github-mcp:8000
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import socket; socket.create_connection(("127.0.0.1", 8000), timeout=3).close()
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - mcp-internal
+      - github-egress
+
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.api
+    command:
+      - python
+      - -m
+      - uvicorn
+      - assistant.api:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --workers
+      - "1"
+    environment:
+      AGENT_API_TOKEN: ${AGENT_API_TOKEN:?Set AGENT_API_TOKEN in .env}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY in .env}
+      MCP_ACCESS_TOKEN: ${MCP_ACCESS_TOKEN:?Set MCP_ACCESS_TOKEN in .env}
+      GITHUB_MCP_URL: http://github-mcp:8000/mcp
+      COMPANY_KNOWLEDGE_ROOT: /data/company-knowledge
+      FILESYSTEM_ROOT: /data/company-knowledge
+      PROJECT_DIRECTORY: /data/company-knowledge
+      FILESYSTEM_SERVER_EXECUTABLE: mcp-server-filesystem
+      OPENAI_MODEL: ${OPENAI_MODEL:-openai:gpt-4.1-mini}
+      AGENT_TIMEOUT_SECONDS: ${AGENT_TIMEOUT_SECONDS:-180}
+      MAX_CONCURRENT_AGENT_RUNS: ${MAX_CONCURRENT_AGENT_RUNS:-8}
+      MCP_STARTUP_MAX_ATTEMPTS: ${MCP_STARTUP_MAX_ATTEMPTS:-5}
+      MCP_STARTUP_RETRY_DELAY_SECONDS: ${MCP_STARTUP_RETRY_DELAY_SECONDS:-1}
+    expose:
+      - "8080"
+    volumes:
+      - ${COMPANY_KNOWLEDGE_HOST_PATH:-../../company-knowledge}:/data/company-knowledge:ro
+      - assistant-reports:/data/reports
+    depends_on:
+      github-mcp:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8080/health/ready", timeout=3)
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - proxy
+      - mcp-internal
+
+  caddy:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.caddy
+    environment:
+      CADDY_DOMAIN: ${CADDY_DOMAIN:-localhost}
+      CADDY_BASIC_AUTH_USERNAME: ${CADDY_BASIC_AUTH_USERNAME:?Set CADDY_BASIC_AUTH_USERNAME in .env}
+      CADDY_BASIC_AUTH_HASH: ${CADDY_BASIC_AUTH_HASH:?Set CADDY_BASIC_AUTH_HASH in .env}
+      AGENT_API_TOKEN: ${AGENT_API_TOKEN:?Set AGENT_API_TOKEN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null http://127.0.0.1:2019/config/
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    networks:
+      - proxy
+
+volumes:
+  assistant-reports:
+  caddy-data:
+  caddy-config:
+
+networks:
+  proxy:
+    driver: bridge
+  mcp-internal:
+    driver: bridge
+    internal: true
+  github-egress:
+    driver: bridge

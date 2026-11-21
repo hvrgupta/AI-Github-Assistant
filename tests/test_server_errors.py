@@ -6,10 +6,49 @@ import httpx
 
 os.environ.setdefault("GITHUB_TOKEN", "test-token")
 
-from server import call_github
+from assistant.github_mcp_server import EnvironmentTokenVerifier, call_github
+from assistant.services.github_service import GithubService
+import assistant.github_mcp_server as github_mcp_server
 
 
 class GitHubServerErrorTests(unittest.IsolatedAsyncioTestCase):
+    def test_write_operations_are_not_exposed_or_implemented(self):
+        self.assertFalse(hasattr(github_mcp_server, "create_issue"))
+        self.assertFalse(hasattr(GithubService, "create_issue"))
+        self.assertFalse(hasattr(github_mcp_server, "confirm_issue"))
+
+    async def test_token_verifier_uses_configured_token_and_scopes(self):
+        verifier = EnvironmentTokenVerifier()
+        with (
+            patch(
+                "assistant.github_mcp_server.MCP_ACCESS_TOKEN",
+                "configured-test-token"
+            ),
+            patch(
+                "assistant.github_mcp_server.MCP_ACCESS_SCOPES",
+                ("github:read",)
+            )
+        ):
+            access_token = await verifier.verify_token(
+                "configured-test-token"
+            )
+
+        self.assertIsNotNone(access_token)
+        self.assertEqual(
+            access_token.scopes,
+            ["github:read"]
+        )
+
+    async def test_token_verifier_rejects_unconfigured_token(self):
+        verifier = EnvironmentTokenVerifier()
+        with patch(
+            "assistant.github_mcp_server.MCP_ACCESS_TOKEN",
+            "configured-test-token"
+        ):
+            access_token = await verifier.verify_token("wrong-token")
+
+        self.assertIsNone(access_token)
+
     async def test_transient_read_failure_is_retried(self):
         attempts = 0
 
@@ -21,7 +60,7 @@ class GitHubServerErrorTests(unittest.IsolatedAsyncioTestCase):
             return {"ok": True}
 
         with patch(
-            "server.asyncio.sleep",
+            "assistant.github_mcp_server.asyncio.sleep",
             new_callable=AsyncMock
         ) as sleep:
             result = await call_github(
@@ -33,23 +72,6 @@ class GitHubServerErrorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"ok": True})
         self.assertEqual(attempts, 2)
         sleep.assert_awaited_once_with(0.5)
-
-    async def test_issue_creation_timeout_is_not_retried(self):
-        attempts = 0
-
-        async def request():
-            nonlocal attempts
-            attempts += 1
-            raise httpx.ReadTimeout("response timed out")
-
-        with self.assertRaisesRegex(RuntimeError, "outcome may be unknown"):
-            await call_github(
-                "issue creation",
-                request,
-                retry_safe=False
-            )
-
-        self.assertEqual(attempts, 1)
 
     async def test_github_error_message_is_reported(self):
         request = httpx.Request("GET", "https://api.github.com/search/repositories")

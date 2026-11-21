@@ -1,7 +1,10 @@
-mcp[cli]
-httpx
+mcp[cli]==2.3.0
+fastapi>=0.115,<1.0
+uvicorn>=0.34,<1.0
+httpx==0.28.1
+httpx2==2.16.0
 python-dotenv
-pydantic
-langchain
-langchain-openai
-langgraph
+pydantic>=2.9,<3.0
+langchain==1.5.0
+langchain-openai==1.7.4
+langgraph==1.2.21

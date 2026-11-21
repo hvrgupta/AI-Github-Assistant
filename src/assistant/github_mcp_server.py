@@ -1,25 +1,42 @@
 import asyncio
+import hmac
+import os
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 import httpx
-from typing import Annotated
+from dotenv import load_dotenv
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
-from mcp.server.mcpserver import Elicit, Resolve
 from mcp.types import ToolAnnotations
-from pydantic import AnyHttpUrl, BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel
 
-from services.github_service import GithubService
+from assistant.services.github_service import GithubService
 
+load_dotenv()
 
 SERVER_NAME = "GitHub Developer Assistant"
-SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 8000
-RESOURCE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}/mcp"
-AUTH_ISSUER_URL = "https://auth.example.com"
+SERVER_HOST = os.getenv("MCP_SERVER_HOST", "127.0.0.1")
+SERVER_PORT = int(os.getenv("MCP_SERVER_PORT", "8000"))
+RESOURCE_URL = os.getenv(
+    "MCP_RESOURCE_URL",
+    f"http://{SERVER_HOST}:{SERVER_PORT}/mcp"
+)
+AUTH_ISSUER_URL = os.getenv(
+    "MCP_AUTH_ISSUER_URL",
+    "https://auth.example.com"
+)
+MCP_ACCESS_TOKEN = os.getenv("MCP_ACCESS_TOKEN")
+MCP_ACCESS_SCOPES = tuple(
+    scope.strip()
+    for scope in os.getenv(
+        "MCP_ACCESS_SCOPES",
+        "github:read"
+    ).split(",")
+    if scope.strip()
+)
 GITHUB_REQUEST_TIMEOUT_SECONDS = 20
 GITHUB_MAX_ATTEMPTS = 3
 GITHUB_RETRY_BASE_DELAY_SECONDS = 0.5
@@ -55,46 +72,66 @@ class RepositorySearchOutput(BaseModel):
     repositories: list[RepositoryOutput]
 
 
+class RepositoryDetailsOutput(BaseModel):
+    name: str
+    description: str | None = None
+    url: str
+    stars: int
+    forks: int
+    language: str | None = None
+    default_branch: str
+    updated_at: str
+
+
+class CommitOutput(BaseModel):
+    sha: str
+    message: str
+    author: str | None = None
+    url: str
+    committed_at: str | None = None
+
+
+class CommitListOutput(BaseModel):
+    commits: list[CommitOutput]
+
+
 class IssueOutput(BaseModel):
     number: int
     title: str
     url: str
     state: str
+    author: str
     created_at: str
+    updated_at: str
 
 
-class CreateIssueOutput(BaseModel):
-    created: bool
-    message: str
-    issue: IssueOutput | None = None
+class IssueListOutput(BaseModel):
+    issues: list[IssueOutput]
 
 
-class IssueConfirmation(BaseModel):
-    confirm: bool = Field(
-        description="Do you want to create this GitHub issue?"
-    )
+class FileContentOutput(BaseModel):
+    path: str
+    name: str
+    sha: str
+    size: int
+    content: str
+    url: str
 
 
-# Authentication
-KNOWN_TOKENS: dict[str, AccessToken] = {
-    "dev-read-token": AccessToken(
-        token="dev-read-token",
-        client_id="read-client",
-        scopes=["github:read"],
-        resource=RESOURCE_URL
-    ),
-    "dev-write-token": AccessToken(
-        token="dev-write-token",
-        client_id="write-client",
-        scopes=["github:read", "github:write"],
-        resource=RESOURCE_URL
-    )
-}
-
-
-class StaticTokenVerifier(TokenVerifier):
+class EnvironmentTokenVerifier(TokenVerifier):
     async def verify_token(self, token: str) -> AccessToken | None:
-        return KNOWN_TOKENS.get(token)
+        if not MCP_ACCESS_TOKEN or not hmac.compare_digest(
+            token.encode("utf-8"),
+            MCP_ACCESS_TOKEN.encode("utf-8")
+        ):
+            return None
+
+        return AccessToken(
+            token=token,
+            client_id="configured-mcp-client",
+            scopes=list(MCP_ACCESS_SCOPES),
+            resource=RESOURCE_URL
+        )
 
 
 def require_scope(required_scope: str) -> None:
@@ -108,7 +145,7 @@ def require_scope(required_scope: str) -> None:
 # MCP server and service dependencies
 mcp = MCPServer(
     SERVER_NAME,
-    token_verifier=StaticTokenVerifier(),
+    token_verifier=EnvironmentTokenVerifier(),
     auth=AuthSettings(
         issuer_url=AnyHttpUrl(AUTH_ISSUER_URL),
         resource_server_url=AnyHttpUrl(RESOURCE_URL),
@@ -259,68 +296,112 @@ async def get_pull_request(
     return PullRequestOutput(**result)
 
 
-async def confirm_issue(
-    owner: str,
-    repo: str,
-    title: str
-) -> IssueConfirmation | Elicit[IssueConfirmation]:
-    require_scope("github:write")
-
-    return Elicit(
-        f"Do you want to create the issue '{title}' in {owner}/{repo}?",
-        IssueConfirmation
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Get repository details",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True
     )
+)
+async def get_repository(
+    owner: str,
+    repo: str
+) -> RepositoryDetailsOutput:
+    """Get metadata for a GitHub repository."""
+    require_scope("github:read")
+    if not owner.strip() or not repo.strip():
+        raise ValueError("Owner and repository are required")
+    result = await call_github(
+        "repository details",
+        lambda: github.get_repository(owner, repo),
+        retry_safe=True
+    )
+    return RepositoryDetailsOutput(**result)
 
 
 @mcp.tool(
     annotations=ToolAnnotations(
-        title="Create a GitHub issue",
-        readOnlyHint=False,
+        title="Get repository file contents",
+        readOnlyHint=True,
         destructiveHint=False,
-        idempotentHint=False,
+        idempotentHint=True,
         openWorldHint=True
     )
 )
-async def create_issue(
+async def get_file_contents(
     owner: str,
     repo: str,
-    title: str,
-    body: str,
-    confirmation: Annotated[
-        IssueConfirmation,
-        Resolve(confirm_issue)
-    ]
-) -> CreateIssueOutput:
-    """Create a new issue in a GitHub repository."""
-    require_scope("github:write")
-
-    if not confirmation.confirm:
-        return CreateIssueOutput(
-            created=False,
-            message="Issue creation cancelled by user."
-        )
-
-    if not owner.strip() or not repo.strip():
-        raise ValueError("Owner and repository are required")
-
-    if not title.strip():
-        raise ValueError("Issue title cannot be empty")
-
+    path: str,
+    ref: str | None = None
+) -> FileContentOutput:
+    """Retrieve text file contents from a GitHub repository."""
+    require_scope("github:read")
+    if not owner.strip() or not repo.strip() or not path.strip():
+        raise ValueError("Owner, repository, and path are required")
     result = await call_github(
-        "issue creation",
-        lambda: github.create_issue(
-            owner=owner,
-            repo=repo,
-            title=title,
-            body=body
-        ),
-        retry_safe=False
+        "repository file contents",
+        lambda: github.get_file_contents(owner, repo, path, ref),
+        retry_safe=True
     )
-    return CreateIssueOutput(
-        created=True,
-        message="Issue created successfully.",
-        issue=IssueOutput(**result)
+    return FileContentOutput(**result)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="List repository commits",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True
     )
+)
+async def list_commits(
+    owner: str,
+    repo: str,
+    branch: str | None = None,
+    limit: int = 10
+) -> CommitListOutput:
+    """List recent commits in a GitHub repository."""
+    require_scope("github:read")
+    if not 1 <= limit <= 100:
+        raise ValueError("Limit must be between 1 and 100")
+    result = await call_github(
+        "commit list",
+        lambda: github.list_commits(owner, repo, branch, limit),
+        retry_safe=True
+    )
+    return CommitListOutput(**result)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="List repository issues",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True
+    )
+)
+async def list_issues(
+    owner: str,
+    repo: str,
+    state: str = "open",
+    limit: int = 10
+) -> IssueListOutput:
+    """List issues in a GitHub repository."""
+    require_scope("github:read")
+    if state not in {"open", "closed", "all"}:
+        raise ValueError("State must be open, closed, or all")
+    if not 1 <= limit <= 100:
+        raise ValueError("Limit must be between 1 and 100")
+    result = await call_github(
+        "issue list",
+        lambda: github.list_issues(owner, repo, state, limit),
+        retry_safe=True
+    )
+    return IssueListOutput(**result)
 
 
 # MCP resources and prompts
@@ -334,12 +415,12 @@ def get_assistant_guidelines() -> str:
     GitHub Developer Assistant Guidelines
 
     1. Never invent GitHub repository information.
-    2. Verify repository owner and name before write operations.
-    3. Explain proposed changes clearly.
-    4. Never create an issue without human approval.
-    5. Use clear, descriptive issue titles.
-    6. Include reproduction steps when reporting bugs.
-    7. Prefer factual information from GitHub API responses.
+    2. This server is strictly read-only.
+    3. Never claim that an issue, file, commit, or repository was modified.
+    4. Clearly distinguish retrieved facts from explanations.
+    5. Include repository names and GitHub URLs when available.
+    6. Prefer factual information from GitHub API responses.
+    7. State explicitly when GitHub information could not be retrieved.
     """
 
 
@@ -370,6 +451,20 @@ def review_pull_request(owner: str, repo: str, pull_number: int) -> str:
 
 
 def run_server() -> None:
+    if not MCP_ACCESS_TOKEN:
+        raise RuntimeError(
+            "MCP_ACCESS_TOKEN must be configured before starting the server."
+        )
+    unsupported_scopes = set(MCP_ACCESS_SCOPES) - {"github:read"}
+    if unsupported_scopes:
+        raise RuntimeError(
+            "MCP_ACCESS_SCOPES contains unsupported scope(s): "
+            + ", ".join(sorted(unsupported_scopes))
+        )
+    if "github:read" not in MCP_ACCESS_SCOPES:
+        raise RuntimeError(
+            "MCP_ACCESS_SCOPES must include github:read."
+        )
     mcp.run(
         transport="streamable-http",
         host=SERVER_HOST,

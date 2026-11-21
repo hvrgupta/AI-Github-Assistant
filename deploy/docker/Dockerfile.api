@@ -1,0 +1,38 @@
+FROM node:24-bookworm-slim AS filesystem-mcp
+
+RUN npm install --global --no-audit --no-fund @modelcontextprotocol/server-filesystem@2.4.0
+
+FROM python:3.13-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app/src
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        libatomic1 \
+        libgcc-s1 \
+        libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid app \
+        --home-dir /app --no-create-home --shell /usr/sbin/nologin app \
+    && mkdir -p /app /data/reports /data/company-knowledge \
+    && chown -R app:app /app /data
+
+COPY --from=filesystem-mcp /usr/local/bin/node /usr/local/bin/node
+COPY --from=filesystem-mcp \
+    /usr/local/lib/node_modules/@modelcontextprotocol/ \
+    /usr/local/lib/node_modules/@modelcontextprotocol/
+RUN ln -s \
+    /usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js \
+    /usr/local/bin/mcp-server-filesystem
+
+WORKDIR /app
+COPY requirements.txt .
+RUN python -m pip install --no-cache-dir -r requirements.txt
+COPY --chown=app:app src/assistant /app/src/assistant
+
+USER 10001:10001
+EXPOSE 8080

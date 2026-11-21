@@ -5,7 +5,7 @@ from unittest.mock import patch
 import anyio
 import httpx2
 
-from multi_server_agent import (
+from assistant.mcp.mcp_client_runtime import (
     MCPRequestError,
     MCPConnectionManager,
     call_mcp_tool
@@ -13,10 +13,11 @@ from multi_server_agent import (
 
 
 class FakeMCPClient:
-    def __init__(self, result=None, error=None, action=None):
+    def __init__(self, result=None, error=None, action=None, close_error=None):
         self.result = result
         self.error = error
         self.action = action
+        self.close_error = close_error
         self.calls = 0
         self.closed = False
 
@@ -25,6 +26,8 @@ class FakeMCPClient:
 
     async def __aexit__(self, exc_type, exc_value, traceback):
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
     async def list_tools(self):
         return SimpleNamespace(tools=[])
@@ -47,7 +50,7 @@ class ManagedFakeMCPClient(FakeMCPClient):
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
-        self.closed = True
+        await super().__aexit__(exc_type, exc_value, traceback)
 
     async def list_tools(self):
         return SimpleNamespace(tools=[])
@@ -106,7 +109,46 @@ class MCPReconnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(original.calls, 1)
         self.assertEqual(replacement.calls, 1)
 
-        self.assertIs(connection.client, replacement)
+    async def test_transport_error_during_shutdown_is_reported_not_raised(self):
+        request = httpx2.Request("POST", "http://127.0.0.1:8000/mcp")
+        connection_error = httpx2.ConnectError(
+            "All connection attempts failed",
+            request=request
+        )
+        client = ManagedFakeMCPClient(
+            result=tool_result(),
+            close_error=ExceptionGroup(
+                "transport task failed",
+                [connection_error]
+            )
+        )
+        connection = MCPConnectionManager(
+            "GitHub",
+            lambda: client
+        )
+        self.addAsyncCleanup(connection.close)
+
+        await connection.connect()
+        await connection.close()
+
+        self.assertTrue(client.closed)
+
+    async def test_unexpected_shutdown_error_is_not_suppressed(self):
+        client = ManagedFakeMCPClient(
+            result=tool_result(),
+            close_error=RuntimeError("unexpected cleanup failure")
+        )
+        connection = MCPConnectionManager(
+            "Filesystem",
+            lambda: client
+        )
+
+        await connection.connect()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "unexpected cleanup failure"
+        ):
+            await connection.close()
 
     async def test_server_tool_error_text_is_preserved(self):
         client = FakeMCPClient(
@@ -155,7 +197,10 @@ class MCPReconnectionTests(unittest.IsolatedAsyncioTestCase):
         connection = FakeConnection(original, replacement=replacement)
         self.addAsyncCleanup(connection.close)
 
-        with patch("multi_server_agent.MCP_REQUEST_TIMEOUT_SECONDS", 0.001):
+        with patch(
+            "assistant.mcp.mcp_client_runtime.MCP_REQUEST_TIMEOUT_SECONDS",
+            0.001
+        ):
             result = await call_mcp_tool(
                 connection,
                 "list_directory",

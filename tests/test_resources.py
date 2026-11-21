@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -7,10 +8,17 @@ from mcp.types import TextResourceContents
 
 
 async def main():
+    project_root = Path(__file__).resolve().parents[1]
+    source_path = str(project_root / "src")
+    server_env = os.environ.copy()
+    server_env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (source_path, server_env.get("PYTHONPATH")))
+    )
 
     server_params = StdioServerParameters(
         command=sys.executable,
-        args=[str(Path(__file__).with_name("server.py"))]
+        args=["-m", "assistant.github_mcp_server"],
+        env=server_env
     )
 
     async with Client(server_params) as client:
